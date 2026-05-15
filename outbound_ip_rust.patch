@@ -1,0 +1,360 @@
+diff -ruN original/src/config.rs MasterHttpRelayVPN-RUST/src/config.rs
+--- a/src/config.rs	2026-05-15 20:48:59.545059926 +0000
++++ b/src/config.rs	2026-05-15 10:02:10.090543042 +0000
+@@ -306,6 +306,16 @@
+     #[serde(default = "default_block_doh")]
+     pub block_doh: bool,
+ 
++    /// Local IP address to bind outbound TCP connections to.
++    /// When set, every upstream TCP socket is bound to this IP before
++    /// connecting, forcing all traffic — regardless of mode (apps_script,
++    /// direct, full) — through the network interface that owns this address.
++    /// Leave unset (or null) to let the OS choose via the default routing table.
++    /// Set automatically by the PowerShell GUI when the user picks a
++    /// specific network adapter from the Net selector.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub outbound_ip: Option<String>,
++
+     /// Multi-edge domain-fronting groups. Each group is a triple of
+     /// (edge IP, front SNI, member domains): when a CONNECT to one of
+     /// the member domains arrives, the proxy MITMs at the local CA
+diff -ruN original/src/domain_fronter.rs MasterHttpRelayVPN-RUST/src/domain_fronter.rs
+--- a/src/domain_fronter.rs	2026-05-15 20:48:59.545059926 +0000
++++ b/src/domain_fronter.rs	2026-05-15 10:03:14.357921285 +0000
+@@ -31,6 +31,7 @@
+ use serde_json::Value;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::TcpStream;
++use crate::net_utils::{tcp_connect_addr};
+ use tokio::sync::{broadcast, Mutex};
+ use tokio::time::timeout;
+ use tokio_rustls::client::TlsStream;
+@@ -438,6 +439,10 @@
+     /// Pre-normalized (lowercased, leading-dot stripped) host list for
+     /// fast O(N) match in `exit_node_matches`.
+     exit_node_hosts: Vec<String>,
++    /// Optional local IP to bind all outbound TCP sockets to.
++    /// Mirrors `Config::outbound_ip`. When `Some`, every upstream
++    /// connection is forced through the interface that owns this address.
++    outbound_ip: Option<String>,
+ }
+ 
+ /// Aggregated stats for one remote host.
+@@ -650,6 +655,7 @@
+                 .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
+                 .filter(|h| !h.is_empty())
+                 .collect(),
++            outbound_ip: config.outbound_ip.clone(),
+         })
+     }
+ 
+@@ -945,7 +951,13 @@
+     async fn open(&self) -> Result<PooledStream, FronterError> {
+         // Bounded TCP+TLS open. See `H1_OPEN_TIMEOUT_SECS`.
+         let work = async {
+-            let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
++            let dest = std::net::SocketAddr::new(
++                self.connect_host.parse::<std::net::IpAddr>().map_err(|e| {
++                    FronterError::Relay(format!("invalid google_ip: {}", e))
++                })?,
++                443u16,
++            );
++            let tcp = tcp_connect_addr(dest, self.outbound_ip.as_deref()).await?;
+             let _ = tcp.set_nodelay(true);
+             let sni = self.next_sni();
+             let name = ServerName::try_from(sni)?;
+@@ -1314,7 +1326,16 @@
+     async fn open_h2(
+         &self,
+     ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), OpenH2Error> {
+-        let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
++        let dest = std::net::SocketAddr::new(
++            self.connect_host.parse::<std::net::IpAddr>().map_err(|_| {
++                OpenH2Error::Connect(std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "invalid google_ip",
++                ))
++            })?,
++            443u16,
++        );
++        let tcp = tcp_connect_addr(dest, self.outbound_ip.as_deref()).await?;
+         let _ = tcp.set_nodelay(true);
+         let sni = self.next_sni();
+         let name = ServerName::try_from(sni)?;
+diff -ruN original/src/lib.rs MasterHttpRelayVPN-RUST/src/lib.rs
+--- a/src/lib.rs	2026-05-15 20:48:59.547332562 +0000
++++ b/src/lib.rs	2026-05-15 10:02:33.572264815 +0000
+@@ -7,6 +7,7 @@
+ pub mod domain_fronter;
+ pub mod lan_utils;
+ pub mod mitm;
++pub mod net_utils;
+ pub mod proxy_server;
+ pub mod rlimit;
+ pub mod tunnel_client;
+diff -ruN original/src/net_utils.rs MasterHttpRelayVPN-RUST/src/net_utils.rs
+--- a/src/net_utils.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/src/net_utils.rs	2026-05-15 10:02:26.490323620 +0000
+@@ -0,0 +1,79 @@
++//! Outbound TCP connect helper with optional interface binding.
++//!
++//! All upstream connections in mhrv-rs go through `tcp_connect` instead of
++//! `TcpStream::connect` directly.  When `outbound_ip` is configured, the
++//! socket is bound to that IP before connecting — this forces the OS to route
++//! the connection through the interface that owns the address, regardless of
++//! the global routing table and regardless of which proxy mode is active
++//! (apps_script, direct, full).
++
++use std::net::{IpAddr, SocketAddr};
++use tokio::net::{TcpSocket, TcpStream};
++
++/// Open a TCP connection to `dest`.
++///
++/// If `outbound_ip` is `Some`, the socket is first bound to
++/// `<outbound_ip>:0` (port 0 = OS picks an ephemeral port) before the
++/// connect call.  This selects the network interface without changing any
++/// Windows routing tables.
++///
++/// If `outbound_ip` is `None` (the common case), this is a direct
++/// `TcpStream::connect` — zero overhead versus the old inline calls.
++pub async fn tcp_connect(
++    dest: impl tokio::net::ToSocketAddrs,
++    outbound_ip: Option<&str>,
++) -> std::io::Result<TcpStream> {
++    match outbound_ip {
++        None => TcpStream::connect(dest).await,
++        Some(ip_str) => {
++            let ip: IpAddr = ip_str.parse().map_err(|e| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!("outbound_ip '{}' is not a valid IP address: {}", ip_str, e),
++                )
++            })?;
++            // Use a v4 or v6 socket depending on the bind address type.
++            let socket = match ip {
++                IpAddr::V4(_) => TcpSocket::new_v4()?,
++                IpAddr::V6(_) => TcpSocket::new_v6()?,
++            };
++            socket.bind(SocketAddr::new(ip, 0))?;
++            // `TcpSocket::connect` requires a resolved `SocketAddr`, so we
++            // resolve `dest` the same way `TcpStream::connect` would.
++            use tokio::net::lookup_host;
++            let mut addrs = lookup_host(dest).await?;
++            let dest_addr = addrs.next().ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::AddrNotAvailable,
++                    "destination did not resolve to any address",
++                )
++            })?;
++            socket.connect(dest_addr).await
++        }
++    }
++}
++
++/// Variant that accepts a pre-resolved `SocketAddr` (avoids the extra
++/// `lookup_host` when the caller already has a resolved address).
++pub async fn tcp_connect_addr(
++    dest: SocketAddr,
++    outbound_ip: Option<&str>,
++) -> std::io::Result<TcpStream> {
++    match outbound_ip {
++        None => TcpStream::connect(dest).await,
++        Some(ip_str) => {
++            let ip: IpAddr = ip_str.parse().map_err(|e| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!("outbound_ip '{}' is not a valid IP address: {}", ip_str, e),
++                )
++            })?;
++            let socket = match ip {
++                IpAddr::V4(_) => TcpSocket::new_v4()?,
++                IpAddr::V6(_) => TcpSocket::new_v6()?,
++            };
++            socket.bind(SocketAddr::new(ip, 0))?;
++            socket.connect(dest).await
++        }
++    }
++}
+diff -ruN original/src/proxy_server.rs MasterHttpRelayVPN-RUST/src/proxy_server.rs
+--- a/src/proxy_server.rs	2026-05-15 20:48:59.547332562 +0000
++++ b/src/proxy_server.rs	2026-05-15 10:05:29.236877016 +0000
+@@ -6,6 +6,7 @@
+ use bytes::Bytes;
+ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use tokio::net::{TcpListener, TcpStream, UdpSocket};
++use crate::net_utils::tcp_connect;
+ use tokio::sync::{mpsc, Mutex};
+ use tokio::task::JoinSet;
+ use tokio_rustls::rustls::client::danger::{
+@@ -261,6 +262,10 @@
+     /// domains used only for matching). Empty = feature off (only
+     /// the built-in Google edge SNI-rewrite is active).
+     pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
++    /// Optional local IP to bind all outbound TCP sockets to.
++    /// When Some, forces every upstream connection through the interface
++    /// that owns this address — applies in all modes (apps_script, direct, full).
++    pub outbound_ip: Option<String>,
+ }
+ 
+ /// True if `host` matches a known DoH endpoint — either the built-in
+@@ -511,6 +516,7 @@
+             block_doh: config.block_doh,
+             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
+             fronting_groups,
++            outbound_ip: config.outbound_ip.clone(),
+         });
+ 
+         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
+@@ -1628,7 +1634,7 @@
+             port,
+             via.unwrap_or("direct")
+         );
+-        plain_tcp_passthrough(sock, &host, port, via).await;
++        plain_tcp_passthrough(sock, &host, port, via, rewrite_ctx.outbound_ip.as_deref()).await;
+         return Ok(());
+     }
+ 
+@@ -1662,7 +1668,7 @@
+             port,
+             via.unwrap_or("direct")
+         );
+-        plain_tcp_passthrough(sock, &host, port, via).await;
++        plain_tcp_passthrough(sock, &host, port, via, rewrite_ctx.outbound_ip.as_deref()).await;
+         return Ok(());
+     }
+ 
+@@ -1748,7 +1754,7 @@
+             port,
+             via.unwrap_or("direct")
+         );
+-        plain_tcp_passthrough(sock, &host, port, via).await;
++        plain_tcp_passthrough(sock, &host, port, via, rewrite_ctx.outbound_ip.as_deref()).await;
+         return Ok(());
+     }
+ 
+@@ -1763,7 +1769,7 @@
+                 host,
+                 port
+             );
+-            plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref()).await;
++            plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref(), rewrite_ctx.outbound_ip.as_deref()).await;
+             return Ok(());
+         }
+     };
+@@ -1789,7 +1795,7 @@
+                 port,
+                 via.unwrap_or("direct")
+             );
+-            plain_tcp_passthrough(sock, &host, port, via).await;
++            plain_tcp_passthrough(sock, &host, port, via, rewrite_ctx.outbound_ip.as_deref()).await;
+             return Ok(());
+         }
+     };
+@@ -1830,7 +1836,7 @@
+         port,
+         via.unwrap_or("direct")
+     );
+-    plain_tcp_passthrough(sock, &host, port, via).await;
++    plain_tcp_passthrough(sock, &host, port, via, rewrite_ctx.outbound_ip.as_deref()).await;
+     Ok(())
+ }
+ 
+@@ -1841,19 +1847,9 @@
+     host: &str,
+     port: u16,
+     upstream_socks5: Option<&str>,
++    outbound_ip: Option<&str>,
+ ) {
+     let target_host = host.trim_start_matches('[').trim_end_matches(']');
+-    // Shorter connect timeout for IP literals (4s vs 10s for hostnames).
+-    // Ported from upstream Python 7b1812c: when the target is an IP (i.e.
+-    // a raw Telegram DC, or an IP someone hardcoded), and that route is
+-    // DPI-dropped, the client speeds up its own DC-rotation / fallback if
+-    // we fail fast. Ten seconds of "waiting for a dead IP" translates
+-    // directly into Telegram's 10s-per-DC rotation delay — users see the
+-    // app sit on "connecting..." for nearly a minute as it walks through
+-    // DC1, DC2, DC3. At 4s we cut that in roughly half.
+-    // Hostnames still get 10s because DNS + first-hop TCP genuinely can
+-    // take that long on flaky links, and the resolver fallbacks already
+-    // trim the worst case.
+     let connect_timeout = if looks_like_ip(target_host) {
+         std::time::Duration::from_secs(4)
+     } else {
+@@ -1873,7 +1869,7 @@
+                     port,
+                     e
+                 );
+-                match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port)))
++                match tokio::time::timeout(connect_timeout, tcp_connect((target_host, port), outbound_ip))
+                     .await
+                 {
+                     Ok(Ok(s)) => s,
+@@ -1882,7 +1878,7 @@
+             }
+         }
+     } else {
+-        match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port))).await {
++        match tokio::time::timeout(connect_timeout, tcp_connect((target_host, port), outbound_ip)).await {
+             Ok(Ok(s)) => {
+                 tracing::info!("plain-tcp passthrough -> {}:{}", host, port);
+                 s
+@@ -2264,7 +2260,7 @@
+     // Open outbound TLS to google_ip with SNI=front_domain.
+     let upstream_tcp = match tokio::time::timeout(
+         std::time::Duration::from_secs(10),
+-        TcpStream::connect((target_ip.as_str(), port)),
++        tcp_connect((target_ip.as_str(), port), rewrite_ctx.outbound_ip.as_deref()),
+     )
+     .await
+     {
+@@ -2977,7 +2973,7 @@
+                 );
+                 match tokio::time::timeout(
+                     connect_timeout,
+-                    TcpStream::connect((target_host, port)),
++                    tcp_connect((target_host, port), rewrite_ctx.outbound_ip.as_deref()),
+                 )
+                 .await
+                 {
+@@ -2987,7 +2983,7 @@
+             }
+         }
+     } else {
+-        match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port))).await {
++        match tokio::time::timeout(connect_timeout, tcp_connect((target_host, port), rewrite_ctx.outbound_ip.as_deref())).await {
+             Ok(Ok(s)) => s,
+             Ok(Err(e)) => {
+                 tracing::debug!("plain-http connect {}:{} failed: {}", host, port, e);
+--- a/Cargo.toml	2026-05-15 20:48:58.997200400 +0000
++++ b/Cargo.toml	2026-05-15 20:43:13.018331697 +0000
+@@ -1,6 +1,6 @@
+ [package]
+ name = "mhrv-rs"
+-version = "1.9.26"
++version = "1.9.25"
+ edition = "2021"
+ description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
+ license = "MIT"
+@@ -34,7 +34,7 @@
+ webpki-roots = "0.26"
+ rcgen = { version = "0.13", features = ["x509-parser"] }
+ rustls-pki-types = "1"
+-time = "0.3"
++time = "=0.3.36"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ tracing = "0.1"
+@@ -73,7 +73,7 @@
+     "persistence",
+     "accesskit",
+ ], optional = true }
+-url = "2.5.8"
++url = "=2.4.1"
+ 
+ # Unix-only deps. Must come after `[dependencies]` because starting a new
+ # table here otherwise ends the main one — anything below it (incl. eframe)
+@@ -110,4 +110,3 @@
+ codegen-units = 1
+ lto = true
+ opt-level = 3
+-strip = true
