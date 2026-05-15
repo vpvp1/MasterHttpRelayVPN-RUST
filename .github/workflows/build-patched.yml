@@ -1,0 +1,73 @@
+name: build-patched
+
+on:
+  workflow_dispatch:  # فقط دستی اجرا می‌شه — هیچ تغییری در سورس اصلی ایجاد نمی‌کنه
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Configure Windows GNU linker
+        shell: pwsh
+        run: |
+          $gcc = "${{ steps.setup-msys2.outputs.msys2-location }}\mingw64\bin\gcc.exe" -replace '\\','/'
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE/.cargo | Out-Null
+          Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value '[target.x86_64-pc-windows-gnu]'
+          Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value "linker = '$gcc'"
+
+      - name: Download patch file
+        shell: pwsh
+        run: |
+          # پچ فایل رو از همین ریپو دانلود می‌کنه
+          Copy-Item outbound_ip_rust.patch outbound_ip_rust.patch -ErrorAction SilentlyContinue
+          if (-not (Test-Path "outbound_ip_rust.patch")) {
+            Write-Error "outbound_ip_rust.patch not found in repo root"
+            exit 1
+          }
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          git apply outbound_ip_rust.patch
+          echo "--- Changed files ---"
+          git diff --name-only
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-patched-stable
+          cache-bin: "false"
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-gnu --bin mhrv-rs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-gnu/release/mhrv-rs.exe dist/mhrv-rs.exe
+          Copy-Item assets/launchers/run.bat dist/run.bat
+          Compress-Archive -Path dist/* -DestinationPath mhrv-rs-windows-patched.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mhrv-rs-windows-patched
+          path: mhrv-rs-windows-patched.zip
+          retention-days: 7
