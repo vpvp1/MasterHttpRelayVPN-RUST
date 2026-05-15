@@ -1,0 +1,283 @@
+--- a/src/config.rs	2026-05-15 22:46:05.244002076 +0000
++++ b/src/config.rs	2026-05-15 22:46:45.216311614 +0000
+@@ -316,6 +316,15 @@
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub outbound_ip: Option<String>,
+ 
++    /// Local IP address to bind DNS resolver sockets to.
++    /// When set, every DNS query is sent from this IP, forcing DNS traffic
++    /// through the interface that owns this address — independently
++    /// of `outbound_ip` which controls regular TCP connections.
++    /// Leave unset (or null) to use the same interface as `outbound_ip`,
++    /// or the OS default if that is also unset.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub dns_outbound_ip: Option<String>,
++
+     /// Multi-edge domain-fronting groups. Each group is a triple of
+     /// (edge IP, front SNI, member domains): when a CONNECT to one of
+     /// the member domains arrives, the proxy MITMs at the local CA
+
+--- a/src/net_utils.rs	2026-05-15 22:46:05.244218543 +0000
++++ b/src/net_utils.rs	2026-05-15 22:47:20.844273591 +0000
+@@ -6,10 +6,136 @@
+ //! the connection through the interface that owns the address, regardless of
+ //! the global routing table and regardless of which proxy mode is active
+ //! (apps_script, direct, full).
++//!
++//! DNS resolution goes through `resolve_host` which uses a `hickory-resolver`
++//! instance bound to `dns_outbound_ip` (falls back to `outbound_ip`, then OS
++//! default).  This lets DNS and data traffic use completely separate interfaces.
+ 
+ use std::net::{IpAddr, SocketAddr};
++use std::sync::OnceLock;
++use hickory_resolver::TokioAsyncResolver;
++use hickory_resolver::config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol};
+ use tokio::net::{TcpSocket, TcpStream};
+ 
++// ── Global DNS resolver ──────────────────────────────────────────────────────
++// Built once at startup from `dns_outbound_ip` (or `outbound_ip` as fallback).
++// `OnceLock` is safe across async tasks; the resolver itself is cheaply cloneable.
++static DNS_RESOLVER: OnceLock<TokioAsyncResolver> = OnceLock::new();
++
++/// Initialise the global DNS resolver.
++///
++/// * `dns_bind_ip`  – IP to bind the UDP/TCP DNS socket to (`dns_outbound_ip`).
++/// * `fallback_ip`  – used when `dns_bind_ip` is `None` (`outbound_ip`).
++///
++/// When both are `None` the OS default resolver is used (zero configuration).
++/// Call this once, early in `main` / server startup, before the first query.
++pub fn init_dns_resolver(
++    dns_bind_ip: Option<&str>,
++    fallback_ip: Option<&str>,
++) {
++    let bind_ip = dns_bind_ip.or(fallback_ip);
++
++    let resolver = match bind_ip {
++        None => {
++            // No binding requested — use OS default resolver config.
++            TokioAsyncResolver::tokio(
++                ResolverConfig::default(),
++                ResolverOpts::default(),
++            )
++        }
++        Some(ip_str) => {
++            let bind_addr: IpAddr = match ip_str.parse() {
++                Ok(a) => a,
++                Err(e) => {
++                    tracing::warn!(
++                        "dns_outbound_ip '{}' is invalid ({}); falling back to OS resolver",
++                        ip_str, e
++                    );
++                    let r = TokioAsyncResolver::tokio(
++                        ResolverConfig::default(),
++                        ResolverOpts::default(),
++                    );
++                    let _ = DNS_RESOLVER.set(r);
++                    return;
++                }
++            };
++
++            // Use well-known public DNS servers but bind the socket to the
++            // chosen interface so the OS routes the UDP/TCP packet from there.
++            let name_servers: &[(&str, u16)] = &[
++                ("8.8.8.8", 53),
++                ("8.8.4.4", 53),
++                ("1.1.1.1", 53),
++                ("1.0.0.1", 53),
++            ];
++
++            let mut rc = ResolverConfig::new();
++            for &(ip, port) in name_servers {
++                let ns_addr: IpAddr = ip.parse().unwrap();
++                // Only add servers that match the address family of the bind IP.
++                match (bind_addr, ns_addr) {
++                    (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {
++                        rc.add_name_server(NameServerConfig {
++                            socket_addr: SocketAddr::new(ns_addr, port),
++                            protocol: Protocol::Udp,
++                            tls_dns_name: None,
++                            trust_negative_responses: false,
++                            bind_addr: Some(SocketAddr::new(bind_addr, 0)),
++                            tls_config: None,
++                        });
++                    }
++                    _ => {} // skip mismatched address families
++                }
++            }
++
++            let mut opts = ResolverOpts::default();
++            opts.cache_size = 256;
++            opts.timeout    = std::time::Duration::from_secs(5);
++            opts.attempts   = 2;
++
++            TokioAsyncResolver::tokio(rc, opts)
++        }
++    };
++
++    // Ignore the error if another thread already initialised it.
++    let _ = DNS_RESOLVER.set(resolver);
++}
++
++/// Resolve a hostname to a `SocketAddr`, using the bound DNS resolver.
++///
++/// Falls back to `tokio::net::lookup_host` when the global resolver has not
++/// been initialised (should not happen in normal operation).
++pub async fn resolve_host(
++    host: &str,
++    port: u16,
++) -> std::io::Result<SocketAddr> {
++    if let Some(resolver) = DNS_RESOLVER.get() {
++        let lookup = resolver.lookup_ip(host).await.map_err(|e| {
++            std::io::Error::new(
++                std::io::ErrorKind::AddrNotAvailable,
++                format!("DNS lookup failed for '{}': {}", host, e),
++            )
++        })?;
++        let ip = lookup.iter().next().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::AddrNotAvailable,
++                format!("DNS returned no addresses for '{}'", host),
++            )
++        })?;
++        Ok(SocketAddr::new(ip, port))
++    } else {
++        // Fallback: system resolver via tokio
++        use tokio::net::lookup_host;
++        let mut addrs = lookup_host((host, port)).await?;
++        addrs.next().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::AddrNotAvailable,
++                format!("no addresses for '{}'", host),
++            )
++        })
++    }
++}
++
+ /// Open a TCP connection to `dest`.
+ ///
+ /// If `outbound_ip` is `Some`, the socket is first bound to
+@@ -20,9 +146,12 @@
+ /// If `outbound_ip` is `None` (the common case), this is a direct
+ /// `TcpStream::connect` — zero overhead versus the old inline calls.
+ pub async fn tcp_connect(
+-    dest: impl tokio::net::ToSocketAddrs,
++    host: &str,
++    port: u16,
+     outbound_ip: Option<&str>,
+ ) -> std::io::Result<TcpStream> {
++    // Resolve via our bound DNS resolver (respects dns_outbound_ip).
++    let dest = resolve_host(host, port).await?;
+     match outbound_ip {
+         None => TcpStream::connect(dest).await,
+         Some(ip_str) => {
+@@ -32,23 +161,12 @@
+                     format!("outbound_ip '{}' is not a valid IP address: {}", ip_str, e),
+                 )
+             })?;
+-            // Use a v4 or v6 socket depending on the bind address type.
+             let socket = match ip {
+                 IpAddr::V4(_) => TcpSocket::new_v4()?,
+                 IpAddr::V6(_) => TcpSocket::new_v6()?,
+             };
+             socket.bind(SocketAddr::new(ip, 0))?;
+-            // `TcpSocket::connect` requires a resolved `SocketAddr`, so we
+-            // resolve `dest` the same way `TcpStream::connect` would.
+-            use tokio::net::lookup_host;
+-            let mut addrs = lookup_host(dest).await?;
+-            let dest_addr = addrs.next().ok_or_else(|| {
+-                std::io::Error::new(
+-                    std::io::ErrorKind::AddrNotAvailable,
+-                    "destination did not resolve to any address",
+-                )
+-            })?;
+-            socket.connect(dest_addr).await
++            socket.connect(dest).await
+         }
+     }
+ }
+
+--- a/src/proxy_server.rs	2026-05-15 22:46:05.244225899 +0000
++++ b/src/proxy_server.rs	2026-05-15 22:47:30.821240083 +0000
+@@ -266,6 +266,10 @@
+     /// When Some, forces every upstream connection through the interface
+     /// that owns this address — applies in all modes (apps_script, direct, full).
+     pub outbound_ip: Option<String>,
++    /// Optional local IP to bind DNS resolver sockets to.
++    /// When set, DNS queries are forced through the interface that owns
++    /// this address — independently of `outbound_ip`.
++    pub dns_outbound_ip: Option<String>,
+ }
+ 
+ /// True if `host` matches a known DoH endpoint — either the built-in
+@@ -517,6 +521,7 @@
+             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
+             fronting_groups,
+             outbound_ip: config.outbound_ip.clone(),
++            dns_outbound_ip: config.dns_outbound_ip.clone(),
+         });
+ 
+         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
+
+--- a/src/domain_fronter.rs	2026-05-15 22:46:05.244123994 +0000
++++ b/src/domain_fronter.rs	2026-05-15 22:47:35.779146150 +0000
+@@ -443,6 +443,9 @@
+     /// Mirrors `Config::outbound_ip`. When `Some`, every upstream
+     /// connection is forced through the interface that owns this address.
+     outbound_ip: Option<String>,
++    /// Optional local IP to bind DNS resolver sockets to.
++    /// Mirrors `Config::dns_outbound_ip`.
++    dns_outbound_ip: Option<String>,
+ }
+ 
+ /// Aggregated stats for one remote host.
+@@ -656,6 +659,7 @@
+                 .filter(|h| !h.is_empty())
+                 .collect(),
+             outbound_ip: config.outbound_ip.clone(),
++            dns_outbound_ip: config.dns_outbound_ip.clone(),
+         })
+     }
+ 
+
+--- a/src/main.rs	2026-05-15 22:45:57.321255294 +0000
++++ b/src/main.rs	2026-05-15 22:47:45.329318590 +0000
+@@ -10,6 +10,7 @@
+ use mhrv_rs::cert_installer::{install_ca, is_ca_trusted, reconcile_sudo_environment, remove_ca};
+ use mhrv_rs::config::Config;
+ use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
++use mhrv_rs::net_utils::init_dns_resolver;
+ use mhrv_rs::proxy_server::ProxyServer;
+ use mhrv_rs::{scan_ips, scan_sni, test_cmd};
+ 
+@@ -318,6 +319,20 @@
+         }
+     }
+ 
++    // ── Print selected interface info ────────────────────────────────────
++    let pkt_iface = config.outbound_ip.as_deref().unwrap_or("default (OS)");
++    let dns_iface = config.dns_outbound_ip.as_deref()
++        .or(config.outbound_ip.as_deref())
++        .unwrap_or("default (OS)");
++    tracing::info!("Packet interface  (outbound_ip)    : {}", pkt_iface);
++    tracing::info!("DNS    interface  (dns_outbound_ip): {}", dns_iface);
++
++    // ── Initialise DNS resolver bound to dns_outbound_ip ─────────────────
++    init_dns_resolver(
++        config.dns_outbound_ip.as_deref(),
++        config.outbound_ip.as_deref(),
++    );
++
+     // Initialize MITM manager (generates CA on first run).
+     let base = mhrv_rs::data_dir::data_dir();
+     let mitm = match MitmCertManager::new_in(&base) {
+
+--- a/Cargo.toml	2026-05-15 22:46:05.244225899 +0000
++++ b/Cargo.toml	2026-05-15 22:47:49.373577938 +0000
+@@ -34,6 +34,7 @@
+ webpki-roots = "0.26"
+ rcgen = { version = "0.13", features = ["x509-parser"] }
+ rustls-pki-types = "1"
++hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+ time = "=0.3.36"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
